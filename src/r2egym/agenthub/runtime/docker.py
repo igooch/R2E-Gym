@@ -19,7 +19,6 @@ import shutil
 import uuid
 
 import docker
-import kubernetes
 import tarfile
 import io
 import os
@@ -38,7 +37,10 @@ from r2egym.agenthub.utils.utils import get_logger
 from r2egym.commit_models.diff_classes import ParsedCommit
 from r2egym.swesmith.utils import get_test_command
 
+from k8s_agent_sandbox import SandboxClient
 from kubernetes import client, config, watch
+from jinja2 import Environment, FileSystemLoader
+import yaml
 
 # For Kubernetes exec.
 from kubernetes.stream import stream
@@ -68,6 +70,13 @@ from swebench.harness.test_spec.test_spec import TestSpec
 from swebench.harness.log_parsers import MAP_REPO_TO_PARSER, get_eval_type
 from swebench.harness.grading import get_eval_tests_report, get_resolution_status
 
+DEFAULT_NAMESPACE = "default"
+DOCKER_PATH = "/root/.venv/bin:/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+GROUP = "extensions.agents.x-k8s.io"
+VERSION = "v1alpha1"
+PLURAL = "sandboxtemplates"
+
 
 ##############################################################################
 # Docker runtime
@@ -93,10 +102,13 @@ class DockerRuntime(ExecutionEnvironment):
     ):
         # check if ds is provided (required for all dockers moving forward)
         assert ds, f"Dataset not provided for docker image: {docker_image}"
-        assert backend in ["docker", "kubernetes"], f"Invalid backend: {backend}"
+        assert backend in ["docker", "kubernetes",
+                           "kubernetes-sandbox"], f"Invalid backend: {backend}"
         # swebench specific setup
         self.ds = ds
         self.backend = backend
+        self.custom_api = None
+        self.sb_client = None
         ds_image = None
         if "docker_image" in self.ds:
             ds_image = self.ds["docker_image"]
@@ -111,7 +123,7 @@ class DockerRuntime(ExecutionEnvironment):
             image_name = self.ds['image_name'].replace('__', '_1776_')
             self.swebench_verified = False
             self.docker_image = f'jyangballin/{image_name}:latest'
-        
+
         if self.swebench_verified:
             # also create a test spec for swebench verified dockers (useful for grading)
             self.test_spec = make_test_spec(self.ds)
@@ -136,6 +148,8 @@ class DockerRuntime(ExecutionEnvironment):
                 logger_name = "DockerRuntime"
             elif self.backend == "kubernetes":
                 logger_name = "KubernetesRuntime"
+            elif self.backend == "kubernetes-sandbox":
+                logger_name = "K8sSandboxRuntime"
             else:
                 raise ValueError(f"Invalid backend: {self.backend}")
             self.logger = get_logger(logger_name)  # Pass the module name for clarity
@@ -144,7 +158,7 @@ class DockerRuntime(ExecutionEnvironment):
 
         if self.backend == "docker":
             self.client = docker.from_env(timeout=120)
-        elif self.backend == "kubernetes":
+        elif self.backend in ["kubernetes", "kubernetes-sandbox"]:
             # Try in-cluster config first, fallback to kubeconfig
             try:
                 config.load_incluster_config()
@@ -164,7 +178,7 @@ class DockerRuntime(ExecutionEnvironment):
 
         # Initialize the environment
         self.setup_env()
-        if self.backend == "kubernetes":
+        if self.backend in ["kubernetes", "kubernetes-sandbox"]:
             self.logger.info("Kubernetes environment initialized")
         else:
             self.logger.info("Docker environment initialized")
@@ -255,7 +269,9 @@ class DockerRuntime(ExecutionEnvironment):
                     }
                 ],
                 "imagePullSecrets": [{"name": "dockerhub-pro"}],
-                "nodeSelector": {"karpenter.sh/nodepool": "bigcpu-standby"},
+                "nodeSelector": {
+                    os.getenv("NODE_SELECTOR_KEY", "karpenter.sh/nodepool"): os.getenv("NODE_SELECTOR_VAL", "bigcpu-standby")
+                },
                 "tolerations": [
                     {
                         "key": "node.kubernetes.io/disk-pressure",
@@ -375,6 +391,8 @@ class DockerRuntime(ExecutionEnvironment):
                 self._start_kubernetes_pod(
                     docker_image, command, ctr_name, **docker_kwargs
                 )
+            elif self.backend == "kubernetes-sandbox":
+                self._start_kubernetes_sandbox()
         except Exception as e:
             print("Container start error:", repr(e))
             self.stop_container()
@@ -385,7 +403,7 @@ class DockerRuntime(ExecutionEnvironment):
             self.client.delete_namespaced_pod(
                 name=self.container_name,
                 namespace=DEFAULT_NAMESPACE,
-                body=kubernetes.client.V1DeleteOptions(grace_period_seconds=0),
+                body=client.V1DeleteOptions(grace_period_seconds=0),
                 _request_timeout=60,
             )
 
@@ -397,41 +415,14 @@ class DockerRuntime(ExecutionEnvironment):
                 timeout_seconds=60,  # 1 minute timeout instead of indefinite
             )
 
-            deletion_confirmed = False
             for event in stream:
                 if event["type"] == "DELETED":
                     self.logger.info(f"Kubernetes pod {self.container_name} deleted.")
                     deletion_confirmed = True
                     w.stop()
                     break
-            
-            # If watch times out without seeing deletion, verify pod is gone
-            if not deletion_confirmed:
-                try:
-                    # Check if pod still exists
-                    self.client.read_namespaced_pod(
-                        name=self.container_name, namespace=DEFAULT_NAMESPACE
-                    )
-                    self.logger.warning(
-                        f"Watch timed out but pod {self.container_name} still exists. Forcing deletion."
-                    )
-                    # Try deleting again with force
-                    self.client.delete_namespaced_pod(
-                        name=self.container_name,
-                        namespace=DEFAULT_NAMESPACE,
-                        body=kubernetes.client.V1DeleteOptions(
-                            grace_period_seconds=0,
-                            force=True
-                        ),
-                    )
-                except kubernetes.client.rest.ApiException as e:
-                    if e.status == 404:
-                        # Pod is gone, which is what we want
-                        self.logger.info(f"Confirmed pod {self.container_name} is deleted.")
-                    else:
-                        # Some other API error
-                        self.logger.error(f"Error checking pod status after timeout: {e}")
-        except kubernetes.client.rest.ApiException as e:
+
+        except client.ApiException as e:
             if e.status == 404:
                 # Pod already deleted, ignore
                 self.logger.info(
@@ -452,14 +443,16 @@ class DockerRuntime(ExecutionEnvironment):
                     self.container.remove()
                 elif self.backend == "kubernetes":
                     self._stop_kubernetes_pod()
+                elif self.backend == "kubernetes-sandbox":
+                    self._stop_kubernetes_sandbox()
         except Exception as e:
             print("Container stop/delete error:", repr(e))
-    
+
     def reset_swesmith_tests(self):
         f2p_files = list(set([x.split("::", 1)[0] for x in self.ds[FAIL_TO_PASS]]))
         p2p_files = list(set([x.split("::", 1)[0] for x in self.ds[PASS_TO_PASS]]))
         all_files = list(set(f2p_files + p2p_files))
-        all_files = [f for f in all_files if 
+        all_files = [f for f in all_files if
              os.path.basename(f).startswith('test_') and os.path.basename(f).endswith('.py') or
              os.path.basename(f).endswith('_test.py')]
         commit_id = self.ds['base_commit']
@@ -474,7 +467,7 @@ class DockerRuntime(ExecutionEnvironment):
             commit_id = self.ds['base_commit']
             self.run("git fetch")
             self.run(f"git checkout {commit_id}")
-            # Setup the run_test.sh script for subsequent testing.  
+            # Setup the run_test.sh script for subsequent testing.
             test_command, _ = get_test_command(self.ds)
             eval_script_content = "\n".join(
                 [
@@ -488,16 +481,16 @@ class DockerRuntime(ExecutionEnvironment):
                     f": '>>>>> End Test Output'",
                 ]
             ) + "\n"
-            
+
             with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.sh') as temp_file:
                 temp_file.write(eval_script_content)
                 temp_file.flush()  # Ensure content is written to disk
                 temp_file_path = temp_file.name
-            
+
             # Copy the file to container and clean up
             self.copy_to_container(temp_file_path, "/run_tests.sh")
             os.unlink(temp_file_path)  # Clean up the temporary file
-            
+
             self.run("chmod +x /run_tests.sh")
 
             # Ensure can call and execute the tools in /usr/local/bin.
@@ -705,7 +698,7 @@ class DockerRuntime(ExecutionEnvironment):
         exec_code = code
         exec_workdir = self.repo_path if workdir is None else workdir
 
-        if self.backend == "kubernetes":
+        if self.backend == "kubernetes" or self.backend == "kubernetes-sandbox":
             return self._run_kubernetes(exec_code, timeout, args, workdir=exec_workdir)
 
         command = f"timeout {timeout} {exec_code} {args}"
@@ -741,7 +734,7 @@ class DockerRuntime(ExecutionEnvironment):
             output = re.sub(r"\x1b\[[0-9;]*m|\r", "", output)
             return output, str(error_code)
 
-        ## timeout
+        # timeout
         except concurrent.futures.TimeoutError:
             self.logger.error(f"Timeout: {timeout}s")
             return f"The command took too long to execute (>{timeout}s)", "-1"
@@ -970,18 +963,18 @@ class DockerRuntime(ExecutionEnvironment):
             return parsed_output
         else:
             return parse_log_fn(f"{self.repo_name}")(log_output)
-    
+
     def _calculate_reward_swesmith(self, get_test_output=False, timeout: int = 300) -> float:
         self.reset_swesmith_tests()
         output, error_msg = self.run("/run_tests.sh", timeout=timeout)
         parse = self.parse_logs(output)
-        
+
         fail2pass = [ ".".join(line.split("::")[1:]) for line in self.ds['FAIL_TO_PASS']]
         pass2pass = [ ".".join(line.split("::")[1:]) for line in self.ds['PASS_TO_PASS']]
         # @(Naman, Jas): Parse the output and return the reward. This implementation is a hack rn.
         if not parse:
             return 0.0
-        
+
         # Check fail2pass
         for test_name in fail2pass:
             if test_name not in parse:
@@ -994,7 +987,7 @@ class DockerRuntime(ExecutionEnvironment):
                 test_name = matching_key
             if parse[test_name] != 'PASSED':
                 return 0.0
-        
+
         # Check pass2pass
         for test_name in pass2pass:
             if test_name not in parse:
@@ -1143,3 +1136,171 @@ class DockerRuntime(ExecutionEnvironment):
         # output, error_code = self.run(f"git checkout {self.current_branch}")
 
         return output, error_code
+
+    def _start_kubernetes_sandbox(self):
+        """
+        Uses the SandboxClient to create a claim and wait for the pod to be ready.
+        It then extracts the pod name for standard interaction, bypassing the client's
+        HTTP-based run/write methods.
+        """
+        self.custom_api = client.CustomObjectsApi()
+
+        # Ensure the SandboxTemplate exists for the given image
+        self.template_name = self._get_sandbox_template_name(self.docker_image)
+        self._ensure_sandbox_template_exists()
+
+        # Use SandboxClient to handle the lifecycle: create claim and wait for readiness.
+        self.logger.info(
+            f"Using SandboxClient to provision sandbox from template '{self.template_name}'...")
+        sb_client = SandboxClient(
+            template_name=self.template_name,
+            namespace=DEFAULT_NAMESPACE,
+            sandbox_ready_timeout=600,
+            # Skip Gateway or Tunnel since we will use standard kubectl exec.
+            api_url="http://localhost"
+        )
+
+        try:
+            # This will block until sandbox is created or we hit sandbox ready timeout
+            sb_client.__enter__()
+        except TimeoutError as e:
+            self.logger.error(
+                f"Sandbox failed to become ready within the {sb_client.sandbox_ready_timeout}s timeout.")
+            # The SandboxClient automatically cleans up the SandboxClaim on timeout.
+            # We re-raise a RuntimeError to notify the calling code that setup failed.
+            raise RuntimeError(
+                "Failed to initialize sandbox environment due to a startup timeout.") from e
+
+        # If successful, store the client and extract the pod name.
+        self.sb_client = sb_client
+
+        self.container_name = self.sb_client.pod_name
+
+        if not self.container_name:
+            raise RuntimeError(
+                "SandboxClient successfully started but did not yield a pod name.")
+
+        self.container = self.client.read_namespaced_pod(
+            name=self.container_name, namespace=DEFAULT_NAMESPACE)
+        self.logger.info(
+            f"Sandbox ready. Acquired Pod '{self.container_name}' for standard interaction.")
+
+    def _stop_kubernetes_sandbox(self):
+        """Uses the SandboxClient to gracefully tear down the environment."""
+        if self.sb_client:
+            self.logger.info(
+                f"Cleaning up sandbox resources for Pod '{self.container_name}'...")
+            self.sb_client.__exit__(None, None, None)
+            self.sb_client = None
+
+    @staticmethod
+    def _get_sandbox_template_name(image_name: str) -> str:
+        """Generates a unique, DNS-compliant name for a template from a Docker image."""
+        img_hash = hashlib.md5(image_name.encode()).hexdigest()[:12]
+        return f"r2e-img-{img_hash}"
+
+    def _ensure_sandbox_template_exists(self):
+        """
+        Ensures a template exists, creating it from the verified Jinja2 template
+        and passing in runtime parameters including pod labels.
+        """
+
+        try:
+            # Check if template already exists (logic is the same)
+            self.custom_api.get_namespaced_custom_object(
+                group=GROUP,
+                version=VERSION,
+                namespace=DEFAULT_NAMESPACE,
+                plural=PLURAL,
+                name=self.template_name
+            )
+            self.logger.info(
+                f"SandboxTemplate '{self.template_name}' already exists.")
+            return
+        except client.ApiException as e:
+            if e.status != 404:
+                raise e
+
+        self.logger.info(
+            f"Creating dynamic SandboxTemplate '{self.template_name}'...")
+
+        env_vars = {"PATH": DOCKER_PATH, **
+                    self.docker_kwargs.get("environment", {})}
+        env_spec = [{"name": k, "value": str(v)} for k, v in env_vars.items()]
+
+        # Parameters to pass to the template.
+        runtime_params = {
+            "template_name": self.template_name,
+            "image_name": self.docker_image,
+            "command": ["/bin/sh", "-c"],
+            "args": [self.command] if isinstance(self.command, str) else self.command,
+            "env": env_spec,
+            "nodeSelector_key": os.getenv("NODE_SELECTOR_KEY", "karpenter.sh/nodepool"),
+            "nodeSelector_val": os.getenv("NODE_SELECTOR_VAL", "bigcpu-standby")
+        }
+
+        # Load and render the sandbox template
+        runtime_dir = os.path.dirname(os.path.abspath(__file__))
+        template_dir = os.path.join(runtime_dir, 'templates')
+        j2_env = Environment(loader=FileSystemLoader(
+            template_dir), trim_blocks=True)
+        template = j2_env.get_template('sandbox_template.yaml.j2')
+
+        rendered_yaml = template.render(runtime_params)
+
+        try:
+            manifest = yaml.safe_load(rendered_yaml)
+        except yaml.YAMLError as exc:
+            print(
+                "!!! YAML parsing failed. Review the debug output to find the syntax error. !!!")
+            print("\n" + "="*20 + " BEGIN DEBUG: Rendered YAML " + "="*20)
+            print(rendered_yaml)
+            print("="*20 + "  END DEBUG: Rendered YAML  " + "="*20 + "\n")
+            # Re-raise the exception to stop execution, as we can't proceed.
+            raise exc
+
+        # Create the SandboxTemplate
+        self.custom_api.create_namespaced_custom_object(
+            group=GROUP,
+            version=VERSION,
+            namespace=DEFAULT_NAMESPACE,
+            plural=PLURAL,
+            body=manifest
+        )
+
+    def delete_template(self):
+        """
+        Deletes the SandboxTemplate associated with this runtime's image.
+        WARNING: This removes the template for ALL pods using this image.
+        Only call this when you are sure no other agents need to create
+        new sandboxes from this image.
+        """
+        template_name = self._get_sandbox_template_name(self.docker_image)
+
+        if self.backend != "kubernetes-sandbox":
+            return
+
+        # Ensure we have an API client (in case this is called without start_container)
+        if self.custom_api is None:
+            self.custom_api = client.CustomObjectsApi()
+
+        self.logger.info(
+            f"Attempting to delete SandboxTemplate: {template_name}")
+        try:
+            self.custom_api.delete_namespaced_custom_object(
+                group=GROUP,
+                version=VERSION,
+                namespace=DEFAULT_NAMESPACE,
+                plural=PLURAL,
+                name=template_name,
+                body=client.V1DeleteOptions(grace_period_seconds=0)
+            )
+            self.logger.info(
+                f"Successfully deleted SandboxTemplate: {template_name}")
+        except client.ApiException as e:
+            if e.status == 404:
+                self.logger.warning(
+                    f"SandboxTemplate '{template_name}' not found (already deleted).")
+            else:
+                self.logger.error(f"Failed to delete SandboxTemplate: {e}")
+                raise e

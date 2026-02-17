@@ -1,17 +1,11 @@
 import json
 import glob
 from r2egym.agenthub.utils.log import get_logger
-import openai
-import re
-import yaml
-from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-from datetime import datetime
+from typing import Dict, List, Optional
 from fire import Fire
 from r2egym.commit_models.diff_classes import ParsedCommit
 import numpy as np
-from huggingface_hub import create_repo, upload_folder, HfFolder
+from huggingface_hub import create_repo, upload_folder
 import os
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import subprocess
@@ -120,7 +114,8 @@ def print_results_mt(path: str, max_workers: int = 4) -> None:
             # If pred_files not given in entry, derive from output_action
             if pred_files is None:
                 # Assuming first line of output_action is not a file. Adjust if needed.
-                pred_files = output_action.split("\n")[1:] if output_action else []
+                pred_files = output_action.split(
+                    "\n")[1:] if output_action else []
 
             # Normalize paths
             gt_files = normalize_paths(gt_files)
@@ -130,7 +125,8 @@ def print_results_mt(path: str, max_workers: int = 4) -> None:
 
             # Compute recalls
             recall_all = (
-                np.mean([f in pred_files for f in gt_files]) if gt_files else 1.0
+                np.mean([f in pred_files for f in gt_files]
+                        ) if gt_files else 1.0
             )
             recall_nontest = (
                 np.mean([f in pred_files for f in gt_nontest_files])
@@ -178,11 +174,13 @@ def print_results_mt(path: str, max_workers: int = 4) -> None:
         logger.info(f"Total Entries Processed: {len(recall_all_list)}")
         logger.info("===== Summary of Recalls (All Entries) =====")
         logger.info(f"Average Recall (All): {np.mean(recall_all_list):.4f}")
-        logger.info(f"Average Recall (Non-test): {np.mean(recall_nontest_list):.4f}")
+        logger.info(
+            f"Average Recall (Non-test): {np.mean(recall_nontest_list):.4f}")
         logger.info(f"Average Recall (Test): {np.mean(recall_test_list):.4f}")
 
         if recall_all_single_nontest_list:
-            logger.info("===== Summary of Recalls (Entries with 1 Non-test File) =====")
+            logger.info(
+                "===== Summary of Recalls (Entries with 1 Non-test File) =====")
             logger.info(
                 f"Average Recall (All): {np.mean(recall_all_single_nontest_list):.4f}"
             )
@@ -225,7 +223,8 @@ def print_results(path: str) -> None:
         gt_nontest_files = [
             fd.path for fd in parsed_commit.file_diffs if not fd.is_test_file
         ]
-        gt_test_files = [fd.path for fd in parsed_commit.file_diffs if fd.is_test_file]
+        gt_test_files = [
+            fd.path for fd in parsed_commit.file_diffs if fd.is_test_file]
 
         # If pred_files not given in entry, derive from output_action
         if pred_files is None:
@@ -239,14 +238,16 @@ def print_results(path: str) -> None:
         pred_files = normalize_paths(pred_files)
 
         # Compute recalls
-        recall_all = np.mean([f in pred_files for f in gt_files]) if gt_files else 1.0
+        recall_all = np.mean(
+            [f in pred_files for f in gt_files]) if gt_files else 1.0
         recall_nontest = (
             np.mean([f in pred_files for f in gt_nontest_files])
             if gt_nontest_files
             else 1.0
         )
         recall_test = (
-            np.mean([f in pred_files for f in gt_test_files]) if gt_test_files else 1.0
+            np.mean([f in pred_files for f in gt_test_files]
+                    ) if gt_test_files else 1.0
         )
 
         # Append to overall lists
@@ -279,12 +280,14 @@ def print_results(path: str) -> None:
         logger.info(f"Total Entries Processed: {len(recall_all_list)}")
         logger.info("===== Summary of Recalls (All Entries) =====")
         logger.info(f"Average Recall (All): {np.mean(recall_all_list):.4f}")
-        logger.info(f"Average Recall (Non-test): {np.mean(recall_nontest_list):.4f}")
+        logger.info(
+            f"Average Recall (Non-test): {np.mean(recall_nontest_list):.4f}")
         logger.info(f"Average Recall (Test): {np.mean(recall_test_list):.4f}")
 
         # If we have entries with exactly one non-test file, summarize them
         if recall_all_single_nontest_list:
-            logger.info("===== Summary of Recalls (Entries with 1 Non-test File) =====")
+            logger.info(
+                "===== Summary of Recalls (Entries with 1 Non-test File) =====")
             logger.info(
                 f"Average Recall (All): {np.mean(recall_all_single_nontest_list):.4f}"
             )
@@ -366,13 +369,16 @@ def get_parsed_commit(docker_image: str) -> Optional[ParsedCommit]:
             f"/{repo}/parsed_commit.json",
         ]
 
-        print(f"Running Docker command to extract JSON from image: {docker_image}")
-        json_content = subprocess.check_output(docker_command, stderr=subprocess.STDOUT)
+        print(
+            f"Running Docker command to extract JSON from image: {docker_image}")
+        json_content = subprocess.check_output(
+            docker_command, stderr=subprocess.STDOUT)
         json_str = json_content.decode("utf-8")
 
         # Parse the JSON content into ParsedCommit
         parsed_commit = ParsedCommit(**json.loads(json_str))
-        print(f"Successfully extracted parsed_commit from Docker image: {docker_image}")
+        print(
+            f"Successfully extracted parsed_commit from Docker image: {docker_image}")
         return parsed_commit
 
     except subprocess.CalledProcessError as e:
@@ -382,7 +388,8 @@ def get_parsed_commit(docker_image: str) -> Optional[ParsedCommit]:
     except json.JSONDecodeError as e:
         print(f"Error parsing JSON from Docker image {docker_image}: {e}")
     except TypeError as e:
-        print(f"Error initializing ParsedCommit from JSON data for {docker_image}: {e}")
+        print(
+            f"Error initializing ParsedCommit from JSON data for {docker_image}: {e}")
     except Exception as e:
         print(f"Unexpected error processing {docker_image}: {e}")
 
